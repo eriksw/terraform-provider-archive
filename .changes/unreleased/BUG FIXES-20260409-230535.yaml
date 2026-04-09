@@ -1,0 +1,5 @@
+kind: BUG FIXES
+body: 'resource/archive_file: Replace missing output files during apply instead of during plan'
+time: 2026-04-09T23:05:35.000000Z
+custom:
+    Issue: "451"
