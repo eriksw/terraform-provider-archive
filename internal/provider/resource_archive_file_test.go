@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	r "github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
 )
 
 func TestResource_UpgradeFromVersion2_2_0_ContentConfig(t *testing.T) {
@@ -405,4 +406,118 @@ resource "archive_file" "foo" {
   output_path             = "path"
 }
 `, format)
+}
+
+// TestResource_OutputDeleteAndSourceChange_Matrix verifies the archive_file resource
+// works correctly in CI workflows where the output file may be deleted between runs
+// (e.g. separate plan/apply jobs). It ensures a downstream consumer (terraform_data)
+// only churns when the archive inputs change.
+func TestResource_OutputDeleteAndSourceChange_Matrix(t *testing.T) {
+	td := t.TempDir()
+	outputPath := filepath.Join(td, "matrix_test.zip")
+
+	var originalMd5, originalSha string
+
+	configFunc := func(content string) string {
+		return fmt.Sprintf(`
+resource "archive_file" "this" {
+  type                    = "zip"
+  source_content          = "%s"
+  source_content_filename = "content.txt"
+  output_path             = "%s"
+}
+
+resource "terraform_data" "consumer" {
+  input = {
+    name       = "obj-${archive_file.this.output_md5}.zip"
+    source     = archive_file.this.output_path
+    source_md5 = archive_file.this.output_md5
+  }
+}
+`, content, filepath.ToSlash(outputPath))
+	}
+
+	deleteOutputFile := func() {
+		_ = os.Remove(outputPath)
+	}
+
+	r.Test(t, r.TestCase{
+		ProtoV5ProviderFactories: protoV5ProviderFactories(),
+		Steps: []r.TestStep{
+			// Step 1: Create with content="original". Record hashes.
+			{
+				Config: configFunc("original"),
+				Check: r.ComposeTestCheckFunc(
+					testExtractResourceAttr("archive_file.this", "output_md5", &originalMd5),
+					testExtractResourceAttr("archive_file.this", "output_sha", &originalSha),
+				),
+			},
+			// Step 2: File present + source unchanged -> PlanOnly, expect empty plan.
+			{
+				Config:   configFunc("original"),
+				PlanOnly: true,
+			},
+			// Step 3: File DELETED + source unchanged -> PlanOnly, expect non-empty plan.
+			{
+				PreConfig:          deleteOutputFile,
+				Config:             configFunc("original"),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			// Step 4: File DELETED + source unchanged -> apply.
+			//   Archive re-created with same hashes. Consumer should NOT churn.
+			{
+				PreConfig: deleteOutputFile,
+				Config:    configFunc("original"),
+				Check: r.ComposeTestCheckFunc(
+					r.TestCheckResourceAttrPtr("archive_file.this", "output_md5", &originalMd5),
+					r.TestCheckResourceAttrPtr("archive_file.this", "output_sha", &originalSha),
+				),
+			},
+			// Step 5: File present + source unchanged -> no changes at all.
+			{
+				Config: configFunc("original"),
+				Check: r.ComposeTestCheckFunc(
+					r.TestCheckResourceAttrPtr("archive_file.this", "output_md5", &originalMd5),
+					r.TestCheckResourceAttrPtr("archive_file.this", "output_sha", &originalSha),
+				),
+			},
+			// Step 6: File present + source CHANGED -> new hashes, consumer churns.
+			{
+				Config: configFunc("modified"),
+				Check: r.ComposeTestCheckFunc(
+					func(s *terraform.State) error {
+						rs, ok := s.RootModule().Resources["archive_file.this"]
+						if !ok {
+							return fmt.Errorf("archive_file.this not found in state")
+						}
+						newMd5 := rs.Primary.Attributes["output_md5"]
+						if newMd5 == originalMd5 {
+							return fmt.Errorf("expected output_md5 to change after source modification, but it stayed %s", originalMd5)
+						}
+						return nil
+					},
+				),
+			},
+			// Step 7: File DELETED + source unchanged (still "modified") -> re-create,
+			//   same hashes as step 6. Consumer should NOT churn.
+			{
+				PreConfig: deleteOutputFile,
+				Config:    configFunc("modified"),
+				Check: r.ComposeTestCheckFunc(
+					func(s *terraform.State) error {
+						rs, ok := s.RootModule().Resources["archive_file.this"]
+						if !ok {
+							return fmt.Errorf("archive_file.this not found in state")
+						}
+						newMd5 := rs.Primary.Attributes["output_md5"]
+						if newMd5 == originalMd5 {
+							return fmt.Errorf("expected output_md5 to differ from original %s", originalMd5)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
 }

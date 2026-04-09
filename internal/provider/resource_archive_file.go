@@ -243,6 +243,19 @@ func (d *archiveFileResource) Read(ctx context.Context, req resource.ReadRequest
 		return
 	}
 
+	outputPath := model.OutputPath.ValueString()
+	if _, err := os.Stat(outputPath); err != nil {
+		if os.IsNotExist(err) {
+			resp.State.RemoveResource(ctx)
+			return
+		}
+		resp.Diagnostics.AddError(
+			"Output file error",
+			fmt.Sprintf("error reading output file: %s", err),
+		)
+		return
+	}
+
 	resp.Diagnostics.Append(updateModel(ctx, &model)...)
 
 	diags = resp.State.Set(ctx, model)
