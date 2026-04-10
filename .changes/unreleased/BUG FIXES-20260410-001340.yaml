@@ -1,0 +1,5 @@
+kind: BUG FIXES
+body: 'resource/archive_file: consistently write during apply instead of overwriting during plan'
+time: 2026-04-10T00:13:40.000000Z
+custom:
+    Issue: "451"
