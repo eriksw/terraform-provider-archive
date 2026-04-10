@@ -243,7 +243,80 @@ func (d *archiveFileResource) Read(ctx context.Context, req resource.ReadRequest
 		return
 	}
 
-	resp.Diagnostics.Append(updateModel(ctx, &model)...)
+	outputPath := model.OutputPath.ValueString()
+
+	// If the output file is missing, remove from state to trigger re-creation.
+	fi, err := os.Stat(outputPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			resp.State.RemoveResource(ctx)
+			return
+		}
+		resp.Diagnostics.AddError(
+			"Output file error",
+			fmt.Sprintf("error reading output file: %s", err),
+		)
+		return
+	}
+
+	// Build the archive to a temp file to compute expected checksums from
+	// current source inputs, then compare against the actual output file.
+	// This detects source content drift without ever writing to output_path.
+	tmpFile, err := os.CreateTemp("", "archive-file-*.tmp")
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Temp file error",
+			fmt.Sprintf("error creating temp file: %s", err),
+		)
+		return
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpPath)
+
+	tmpModel := model
+	tmpModel.OutputPath = types.StringValue(tmpPath)
+	if err := archive(ctx, tmpModel); err != nil {
+		resp.Diagnostics.AddError(
+			"Archive creation error",
+			fmt.Sprintf("error creating temp archive: %s", err),
+		)
+		return
+	}
+
+	expectedChecksums, err := genFileChecksums(tmpPath)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Hash generation error",
+			fmt.Sprintf("error generating expected checksums: %s", err),
+		)
+		return
+	}
+
+	actualChecksums, err := genFileChecksums(outputPath)
+	if err != nil {
+		resp.Diagnostics.AddError(
+			"Hash generation error",
+			fmt.Sprintf("error generating actual checksums: %s", err),
+		)
+		return
+	}
+
+	// If the archive on disk doesn't match what we'd build from current
+	// sources, remove from state to trigger a re-create on the next apply.
+	if expectedChecksums.sha256Hex != actualChecksums.sha256Hex {
+		resp.State.RemoveResource(ctx)
+		return
+	}
+
+	model.OutputSize = types.Int64Value(fi.Size())
+	model.OutputMd5 = types.StringValue(actualChecksums.md5Hex)
+	model.OutputSha = types.StringValue(actualChecksums.sha1Hex)
+	model.OutputSha256 = types.StringValue(actualChecksums.sha256Hex)
+	model.OutputBase64Sha256 = types.StringValue(actualChecksums.sha256Base64)
+	model.OutputSha512 = types.StringValue(actualChecksums.sha512Hex)
+	model.OutputBase64Sha512 = types.StringValue(actualChecksums.sha512Base64)
+	model.ID = types.StringValue(actualChecksums.sha1Hex)
 
 	diags = resp.State.Set(ctx, model)
 	resp.Diagnostics.Append(diags...)
